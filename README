@@ -1,0 +1,4 @@
+For an init script, just do:
+    ln -s /opt/policyd-whois/policyd-whois /etc/init.d/policyd-whois
+    ln -s ../init.d/policyd-whois /etc/rc2.d/S20policyd-whois
+

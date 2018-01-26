@@ -1,0 +1,356 @@
+#!/usr/bin/python
+import sys
+import os
+import grp
+import pwd
+import time
+import string
+import datetime
+import sqlite3
+import whois
+import threading
+import traceback
+import logging
+import logging.handlers
+import SocketServer
+import socket
+from daemon import DaemonContext
+from daemon.runner import DaemonRunner
+from daemon.pidlockfile import PIDLockFile
+LOG_MAIL = logging.handlers.SysLogHandler.LOG_MAIL
+
+MODULE_NAME = os.path.split(__file__)[-1].split('.')[0]
+MODULE_PATH = os.path.dirname(os.path.realpath(__file__))
+LOG_PATH = os.path.join('/var/log', MODULE_NAME)
+PID_PATH = os.path.join('/var/run', MODULE_NAME)
+
+CACHE_FILE = os.path.join(PID_PATH, 'whois_cache.db')
+LOG_REQUESTS = True
+
+LISTEN_ADDR = '127.0.0.1'
+LISTEN_PORT = 4444
+MIN_DAYS = 14
+
+RUNAS_USER = 'whoisquery'
+RUNAS_GROUP = 'whoisquery'
+
+RUNAS_UID = pwd.getpwnam(RUNAS_USER).pw_uid
+RUNAS_GID = grp.getgrnam(RUNAS_GROUP).gr_gid
+# useradd -Mr whoisquery
+
+
+
+def mkdirs():
+    """ Make sure that all required paths exist """
+    paths = [ PID_PATH, LOG_PATH, os.path.join(LOG_PATH, 'debug') ]
+    for path in paths:
+        try:
+            os.makedirs(path)
+            os.chown(path, RUNAS_UID, RUNAS_GID)
+        except os.error:
+            pass
+    
+
+            
+class WhoisResult(object):
+        pass
+
+class CachedWhois():
+    def __init__(self, db=None):
+        if db is not None:
+            self.db = db
+        else:
+            self.db = sqlite3.connect(CACHE_FILE)
+            sql = """
+                 CREATE TABLE IF NOT EXISTS whois (
+                                 domain_name text PRIMARY KEY,
+                                 last_queried integer,
+                                 creation_date integer,
+                                 last_updated integer,
+                                 registrar text
+                                 )
+            """
+            self.db.execute(sql)
+
+    def cache_query(self, domain_name):
+        """ Query the cache for a given domain """
+        sql = 'SELECT last_queried, creation_date, last_updated, registrar ' \
+            + 'FROM whois WHERE domain_name=?'
+        result = self.db.execute(sql, [domain_name])
+        row = result.fetchone()
+        if row is not None:
+            r = WhoisResult()
+            r.domain = domain_name
+            r.last_queried = row[0]
+            r.creation_date = row[1]
+            r.last_updated = row[2]
+            r.registrar = row[2]
+            r.cached = True
+            return r
+
+    def getattr_int(self, obj, attrname):
+        if obj is None: return None
+        try:
+            i = getattr(obj, attrname)
+            if type(i) is datetime.datetime:
+                i = i.strftime('%s')
+            i = int(i)
+            return i
+        except KeyError, TypeError:
+            return None
+
+    def cache_fill(self, domain_name):
+        """ Add data to the cache """
+        sql1 = 'DELETE FROM whois where domain_name=?'
+        sql2 = 'INSERT INTO whois(domain_name, last_queried, creation_date, last_updated, registrar) ' \
+             + 'VALUES(?,?,?,?,?)'
+
+        try:
+            result = whois.query(domain_name, ignore_returncode=1)
+        except:
+            logger.exception('Whois query failed')
+            result = None
+
+        last_queried  = int(time.time())
+        creation_date = self.getattr_int(result, 'creation_date')
+        last_updated  = self.getattr_int(result, 'last_updated')
+        if result is None:
+            registrar = None
+        else:
+            registrar = getattr(result, 'registrar', None)
+
+        self.db.execute(sql1, [domain_name])
+        self.db.execute(sql2, [domain_name, last_queried, creation_date, last_updated, registrar])
+        self.db.commit()
+    
+        return result
+
+    def whois_str(self, whois_result):
+        """ Flattens a whois result to a string of key-value pairs """
+        s = ''
+        for k in dir(whois_result):
+            if not k.startswith('_'):
+                if type(k) is str:
+                    s += '%s="%s" ' %(k, getattr(whois_result, k))
+        return s[:-1]
+
+
+    def query_age(self, domain_name):
+        result = self.cache_query(domain_name)
+        if result is None:
+            logger.info('Cache miss. Filling cache for ' + domain_name)
+            result = self.cache_fill(domain_name)
+            result = self.cache_query(domain_name)
+        else:
+            logger.info('Cache hit for ' + domain_name)
+
+        logger.info('Query returned: ' + self.whois_str(result))
+
+        if getattr(result, 'creation_date', None) is None:
+            logger.info('Whois query returned no data for ' + domain_name)
+            return None
+        else:
+            age = time.time() - self.getattr_int(result, 'creation_date')
+            return age
+
+
+
+
+
+class TCPRequestHandler(SocketServer.StreamRequestHandler):
+
+    def is_safe_to_query(self, domain_name):
+        """ Paranoia - only allow queries matching a limited character set """
+        ALLOWED_CHARS = string.ascii_letters + string.digits + '._-'
+        for c in domain_name:
+            if c not in ALLOWED_CHARS:
+                return False
+        return True
+
+    def send_data(self, data):
+        sz = hex(len(data))[2:].zfill(4).decode('hex')
+        return self.request.sendall(sz + data)
+
+    def recv_data(self):
+        """ Receive the full block of data from postfix """
+        """ Raises socket.timeout exception if it cannot get a complete block of data """
+        # TODO - need some kind of timeout to ensure there are no session hangs...
+        timeout_expires = time.time() + 5   # time out after 5 seconds
+        data = ''
+        while not data.endswith('\n\n') and not data.endswith('\r\n\r\n'):
+            data += self.request.recv(8192)
+            if time.time() > timeout_expires:
+                raise socket.timeout('Timeout receiving data.')
+        return data
+
+    def log_raw_data(self, data, ts):
+        """ Dump the raw request into temp for debugging purposes """
+        try:
+            filename = os.path.join(LOG_PATH, 'debug', 'postfix_whois_' + str(ts))
+            f = open(filename, 'wb')
+            f.write(data)
+            f.close()
+        except:
+            logger.exception('Unable to write debug file with raw request.')
+            pass
+
+    def split_data(self, data):
+        """ Split multiple lines of data from postfix into key-value pairs """
+        d = {}
+        for line in data.splitlines():
+            k, v = line.split('=', 1)
+            d[k] = v
+        return d
+
+    def get_domain(self, s):
+        """ Return the domain portion of an email address or hostname """
+        """ Only use the last 3 segments for 2-letter (country) TLDs; all others use 2 segments """
+        domain = s.split('@')[-1]
+        segments = domain.split('.')
+        if len(segments[-1]) == 2:
+            segments = segments[-3:]
+        else:
+            segments = segments[-2:]
+        return '.'.join(segments)
+
+    def recently_registered(self, domain_name):
+        """ Returns true if whois data indicates this domain was recently registered """
+        age = None
+        whois = CachedWhois()
+        age = whois.query_age(domain_name)
+        if age is None:
+            return False                    # Unknown / no whois data
+        elif age/86400 < MIN_DAYS:
+            return True                     # Less than, e.g., 2 weeks old
+        else:
+            return False                    # Has been registered for some time
+
+    def respond(self, action, param=None, domain=''):
+        """ Send the response status back to postfix """
+        data = 'action=' + action
+        log = 'Response '
+        if param is not None:
+            data += ' ' + param
+        if domain is not None:
+            log += 'for domain ' + domain + ' '
+        log += 'was ' + data
+        logger.info(log)
+        self.request.sendall(data + '\n\n') # Postfix wants this to be \n, not \r\n
+
+    
+    def handle(self):
+        """ Main logic for handling each request """
+        self.request.settimeout(5)          # Set socket timeout to 5 seconds
+        src_ip, src_port = self.request.getpeername()
+        src = src_ip + ':' + str(src_port)
+        logger.info('New connection from ' + src)
+        try:
+            now = datetime.datetime.utcnow().strftime('%Y-%m-%d_%H:%M:%S.%f')
+            data = self.recv_data()             # Read the information from postfix
+            if LOG_REQUESTS:                    # Dump full request for troubleshooting
+                self.log_raw_data(data,now) 
+            data = self.split_data(data.strip())    # Split into key-value pairs
+
+    
+            check_fields = ['helo_name', 'sender']
+            for field_name in check_fields:
+                if field_name in data:
+                    domain_name = self.get_domain(data[field_name])
+                    if self.is_safe_to_query(domain_name):
+                        if self.recently_registered(domain_name):
+                            # Found a recently registered domain - likely spam/malware; block it
+                            self.respond('REJECT Go away', domain=domain_name)
+        except socket.timeout:
+            logger.warn('Timed out waiting for data from ' + src + '. Dropping connection.')
+            self.request.close()
+            return
+        except:
+            logger.exception('Unexpected error handling request from ' + src + '. Dropping connection.')
+            self.request.close()
+            return
+
+        # All of the domains checked are either well-established, we couldn't find whois
+        # data, or we skipped the check because of unexpected/weird/unsafe characters
+        # (We'll rely on other mechanisms for suspicious encodings or characters)
+        # 
+        # This daemon should never send an authoritative 'OK', but should instead
+        # respond with DUNNO so that the next policy restriction in the chain gets
+        # checked.
+        self.respond('dunno', domain=domain_name)
+
+
+
+class MainApp(object):
+    stdin_path = "/dev/null"
+    stdout_path = os.path.join(LOG_PATH, "stdout")
+    stderr_path = os.path.join(LOG_PATH, "stderr")
+    pidfile_path = os.path.join(PID_PATH, MODULE_NAME + '.pid')
+    pidfile_timeout = 3
+
+    def __init__(self, argv):
+        pass
+
+    def init_logging(self):
+        global logger
+        #formatter = logging.Formatter("%(asctime)s %(module)s[%(process)s] %(levelname)s %(message)s")
+        formatter = logging.Formatter("%(module)s[%(process)s] %(levelname)s %(message)s")
+        handler = logging.handlers.SysLogHandler(address='/dev/log', facility=LOG_MAIL)
+        handler.setFormatter(formatter)
+
+        logger = logging.getLogger(MODULE_NAME)
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+
+
+    def run(self):
+        #logging.basicConfig(format="%(asctime)s %(module)s[%(process)s] %(levelname)s %(message)s",
+        #                    filename=os.path.join(LOG_PATH, MODULE_NAME + '.log'),
+        #                    level=logging.INFO)
+        self.init_logging()
+        logger.info(MODULE_NAME + ' starting.')
+
+        # Bind and activate separately to prevent holding the socket in TIME_WAIT
+        s = SocketServer.ThreadingTCPServer((LISTEN_ADDR, LISTEN_PORT), TCPRequestHandler, bind_and_activate=False)
+        s.allow_reuse_address = True
+        s.server_bind()
+        s.server_activate()
+
+        thread = threading.Thread(target=s.serve_forever)   # that thread will start one more thread for each request
+        thread.daemon = True    # exit the server thread when the main thread terminates
+        thread.start()
+
+        logger.info('%s server loop running in thread: %s' % (s.RequestHandlerClass.__name__[:3], thread.name))
+
+        try:
+            while 1:
+                time.sleep(1)
+                sys.stdout.flush()
+                sys.stderr.flush()
+        except KeyboardInterrupt:
+            pass
+        except:
+            logger.exception('Unknown error. Shutting down.')
+        finally:
+            logger.info('Shutting down gracefully.')
+            s.shutdown()
+
+
+
+def drop_privs():
+    if os.getuid() != 0:
+        # Already not running as root
+        return
+    else:    
+        # We're root. Drop privileges.
+        os.setgroups([])
+        os.setgid(RUNAS_GID)
+        os.setuid(RUNAS_GID)
+        os.umask(007)
+	print 'Droped privileges to: ', os.getuid(), ' / ', os.getgid()
+    
+
+mkdirs()
+#drop_privs()
+run = DaemonRunner(MainApp(sys.argv))
+run.do_action()
+
