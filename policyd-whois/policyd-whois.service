@@ -2,9 +2,8 @@
 Description=policyd-whois
 
 [Service]
-Type=simple
-ExecStart=/opt/policyd-whois/policyd-whois start
-ExecStop=killall policyd-whois
+ExecStart=/usr/bin/python3 /opt/policyd-whois/policyd-whois start
+ExecStop=/usr/bin/killall policyd-whois
 
 [Install]
 WantedBy=multi-user.target

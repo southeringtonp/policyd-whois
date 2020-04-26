@@ -4,6 +4,11 @@ domains.
 
 See install.sh for recommended file locations.
 
+Additional python libraries may need to be installed as well, e.g.:
+   sudo pip3 install daemon
+   sudo pip3 install sqlite3
+   sudo pip3 install whois
+
 You will also need to update your postfix configuration in main.cf
 to use the policy engine in smtpd_recipient_restrictions, e.g.,
    smtpd_recipient_restrictions = ..., check_policy_service inet:127.0.0.1:4444, ...

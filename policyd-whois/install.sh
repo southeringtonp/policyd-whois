@@ -19,5 +19,9 @@ chmod -Rv 0750 /var/run/policyd-whois
 chmod -v 0755 /opt/policyd-whois/policyd-whois
 
 echo
+echo Reloading systemd...
+systemctl daemon-reload
+
+echo
 echo Now you need to update your postfix configuration and test.
 echo
