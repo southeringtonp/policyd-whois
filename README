@@ -5,7 +5,7 @@ domains.
 See install.sh for recommended file locations.
 
 Additional python libraries may need to be installed as well, e.g.:
-   sudo pip3 install daemon
+   sudo pip3 install python-daemon
    sudo pip3 install sqlite3
    sudo pip3 install whois
 
