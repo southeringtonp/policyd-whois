@@ -319,10 +319,7 @@ class PolicyDaemon(object):
 
 
 if len(sys.argv) != 2:
-    print("Usage: %s start|stop" % MODULE_NAME)
-
-elif sys.argv[1] == 'stop':
-    pass
+    print("Usage: %s start" % MODULE_NAME)
 
 elif sys.argv[1] == 'start':
     context = daemon.DaemonContext(

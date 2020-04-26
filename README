@@ -1,4 +1,11 @@
-For an init script, just do:
-    ln -s /opt/policyd-whois/policyd-whois /etc/init.d/policyd-whois
-    ln -s ../init.d/policyd-whois /etc/rc2.d/S20policyd-whois
+
+Small postfix-compatible policy daemon to check for recently created
+domains.
+
+See install.sh for recommended file locations.
+
+You will also need to update your postfix configuration in main.cf
+to use the policy engine in smtpd_recipient_restrictions, e.g.,
+   smtpd_recipient_restrictions = ..., check_policy_service inet:127.0.0.1:4444, ...
+
 
