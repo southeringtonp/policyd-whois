@@ -1,0 +1,11 @@
+[Unit]
+Description=policyd-whois
+
+[Service]
+Type=simple
+ExecStart=/opt/policyd-whois/policyd-whois start
+ExecStop=killall policyd-whois
+
+[Install]
+WantedBy=multi-user.target
+

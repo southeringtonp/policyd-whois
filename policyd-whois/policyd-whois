@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 import sys
 import os
 import grp
@@ -12,46 +12,25 @@ import threading
 import traceback
 import logging
 import logging.handlers
-import SocketServer
+import socketserver
 import socket
-from daemon import DaemonContext
-from daemon.runner import DaemonRunner
-from daemon.pidlockfile import PIDLockFile
+import daemon       # pip3 install python-daemon (PEP 3143)
 LOG_MAIL = logging.handlers.SysLogHandler.LOG_MAIL
+#sudo useradd -Mr policyd-whois
 
 MODULE_NAME = os.path.split(__file__)[-1].split('.')[0]
 MODULE_PATH = os.path.dirname(os.path.realpath(__file__))
-LOG_PATH = os.path.join('/var/log', MODULE_NAME)
-PID_PATH = os.path.join('/var/run', MODULE_NAME)
+RUN_PATH = os.path.join('/var/run', MODULE_NAME)
 
-CACHE_FILE = os.path.join(PID_PATH, 'whois_cache.db')
+CACHE_FILE = os.path.join(RUN_PATH, 'whois_cache.db')
 LOG_REQUESTS = True
 
 LISTEN_ADDR = '127.0.0.1'
 LISTEN_PORT = 4444
 MIN_DAYS = 14
 
-RUNAS_USER = 'whoisquery'
-RUNAS_GROUP = 'whoisquery'
-
-RUNAS_UID = pwd.getpwnam(RUNAS_USER).pw_uid
-RUNAS_GID = grp.getgrnam(RUNAS_GROUP).gr_gid
-# useradd -Mr whoisquery
 
 
-
-def mkdirs():
-    """ Make sure that all required paths exist """
-    paths = [ PID_PATH, LOG_PATH, os.path.join(LOG_PATH, 'debug') ]
-    for path in paths:
-        try:
-            os.makedirs(path)
-            os.chown(path, RUNAS_UID, RUNAS_GID)
-        except os.error:
-            pass
-    
-
-            
 class WhoisResult(object):
         pass
 
@@ -77,6 +56,7 @@ class CachedWhois():
         sql = 'SELECT last_queried, creation_date, last_updated, registrar ' \
             + 'FROM whois WHERE domain_name=?'
         result = self.db.execute(sql, [domain_name])
+        print(result)   #TODO
         row = result.fetchone()
         if row is not None:
             r = WhoisResult()
@@ -84,7 +64,7 @@ class CachedWhois():
             r.last_queried = row[0]
             r.creation_date = row[1]
             r.last_updated = row[2]
-            r.registrar = row[2]
+            r.registrar = row[3]
             r.cached = True
             return r
 
@@ -96,7 +76,7 @@ class CachedWhois():
                 i = i.strftime('%s')
             i = int(i)
             return i
-        except KeyError, TypeError:
+        except (KeyError, TypeError):
             return None
 
     def cache_fill(self, domain_name):
@@ -108,22 +88,26 @@ class CachedWhois():
         try:
             result = whois.query(domain_name, ignore_returncode=1)
         except:
+            print('Whois query failed') #TODO
             logger.exception('Whois query failed')
             result = None
 
         last_queried  = int(time.time())
         creation_date = self.getattr_int(result, 'creation_date')
         last_updated  = self.getattr_int(result, 'last_updated')
-        if result is None:
+        try:
+            registrar = result.registrar
+        except (AttributeError, KeyError):
             registrar = None
-        else:
-            registrar = getattr(result, 'registrar', None)
 
         self.db.execute(sql1, [domain_name])
         self.db.execute(sql2, [domain_name, last_queried, creation_date, last_updated, registrar])
         self.db.commit()
     
+        print([domain_name, last_queried, creation_date, last_updated, registrar])
+        print(result)
         return result
+
 
     def whois_str(self, whois_result):
         """ Flattens a whois result to a string of key-value pairs """
@@ -157,7 +141,7 @@ class CachedWhois():
 
 
 
-class TCPRequestHandler(SocketServer.StreamRequestHandler):
+class TCPRequestHandler(socketserver.StreamRequestHandler):
 
     def is_safe_to_query(self, domain_name):
         """ Paranoia - only allow queries matching a limited character set """
@@ -178,16 +162,17 @@ class TCPRequestHandler(SocketServer.StreamRequestHandler):
         timeout_expires = time.time() + 5   # time out after 5 seconds
         data = ''
         while not data.endswith('\n\n') and not data.endswith('\r\n\r\n'):
-            data += self.request.recv(8192)
+            r = self.request.recv(8192)
+            data += r.decode('utf-8')
             if time.time() > timeout_expires:
-                raise socket.timeout('Timeout receiving data.')
+                raise socket.timeout('Timeout receiving data from postfix.')
         return data
 
     def log_raw_data(self, data, ts):
         """ Dump the raw request into temp for debugging purposes """
         try:
-            filename = os.path.join(LOG_PATH, 'debug', 'postfix_whois_' + str(ts))
-            f = open(filename, 'wb')
+            filename = os.path.join(RUN_PATH, 'debug', 'postfix_whois_' + str(ts))
+            f = open(filename, 'w')
             f.write(data)
             f.close()
         except:
@@ -219,10 +204,13 @@ class TCPRequestHandler(SocketServer.StreamRequestHandler):
         whois = CachedWhois()
         age = whois.query_age(domain_name)
         if age is None:
+            logger.info('TEST1')
             return False                    # Unknown / no whois data
         elif age/86400 < MIN_DAYS:
+            logger.info('TEST2')
             return True                     # Less than, e.g., 2 weeks old
         else:
+            logger.info('TEST3')
             return False                    # Has been registered for some time
 
     def respond(self, action, param=None, domain=''):
@@ -234,6 +222,8 @@ class TCPRequestHandler(SocketServer.StreamRequestHandler):
         if domain is not None:
             log += 'for domain ' + domain + ' '
         log += 'was ' + data
+        if action == 'dunno':
+            log += ' (allow and continue to next policy)'
         logger.info(log)
         self.request.sendall(data + '\n\n') # Postfix wants this to be \n, not \r\n
 
@@ -280,12 +270,7 @@ class TCPRequestHandler(SocketServer.StreamRequestHandler):
 
 
 
-class MainApp(object):
-    stdin_path = "/dev/null"
-    stdout_path = os.path.join(LOG_PATH, "stdout")
-    stderr_path = os.path.join(LOG_PATH, "stderr")
-    pidfile_path = os.path.join(PID_PATH, MODULE_NAME + '.pid')
-    pidfile_timeout = 3
+class PolicyDaemon(object):
 
     def __init__(self, argv):
         pass
@@ -301,16 +286,15 @@ class MainApp(object):
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)
 
-
     def run(self):
         #logging.basicConfig(format="%(asctime)s %(module)s[%(process)s] %(levelname)s %(message)s",
-        #                    filename=os.path.join(LOG_PATH, MODULE_NAME + '.log'),
+        #                    filename=os.path.join(RUN_PATH, MODULE_NAME + '.log'),
         #                    level=logging.INFO)
         self.init_logging()
         logger.info(MODULE_NAME + ' starting.')
 
-        # Bind and activate separately to prevent holding the socket in TIME_WAIT
-        s = SocketServer.ThreadingTCPServer((LISTEN_ADDR, LISTEN_PORT), TCPRequestHandler, bind_and_activate=False)
+        # Bind and activate in separate steps to prevent holding the socket in TIME_WAIT
+        s = socketserver.ThreadingTCPServer((LISTEN_ADDR, LISTEN_PORT), TCPRequestHandler, bind_and_activate=False)
         s.allow_reuse_address = True
         s.server_bind()
         s.server_activate()
@@ -322,11 +306,9 @@ class MainApp(object):
         logger.info('%s server loop running in thread: %s' % (s.RequestHandlerClass.__name__[:3], thread.name))
 
         try:
-            while 1:
+            while True:
                 time.sleep(1)
-                sys.stdout.flush()
-                sys.stderr.flush()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
             pass
         except:
             logger.exception('Unknown error. Shutting down.')
@@ -336,21 +318,20 @@ class MainApp(object):
 
 
 
-def drop_privs():
-    if os.getuid() != 0:
-        # Already not running as root
-        return
-    else:    
-        # We're root. Drop privileges.
-        os.setgroups([])
-        os.setgid(RUNAS_GID)
-        os.setuid(RUNAS_GID)
-        os.umask(007)
-	print 'Droped privileges to: ', os.getuid(), ' / ', os.getgid()
-    
+if len(sys.argv) != 2:
+    print("Usage: %s start|stop" % MODULE_NAME)
 
-mkdirs()
-#drop_privs()
-run = DaemonRunner(MainApp(sys.argv))
-run.do_action()
+elif sys.argv[1] == 'stop':
+    pass
+
+elif sys.argv[1] == 'start':
+    context = daemon.DaemonContext(
+        working_directory = ".",
+        umask = 0o002,
+        stderr = open(os.path.join(RUN_PATH,'stderr'), 'w'),
+        stdout = open(os.path.join(RUN_PATH,'stdout'), 'w')
+    )
+    with context:
+        program = PolicyDaemon(sys.argv)
+        program.run()
 
